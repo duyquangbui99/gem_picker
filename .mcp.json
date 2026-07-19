@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "robinhood-trading": {
+      "type": "http",
+      "url": "https://agent.robinhood.com/mcp/trading"
+    },
+    "coinbase": {
+      "type": "http",
+      "url": "REPLACE_ME_DURING_SETUP - see scripts/setup_mcp.sh and docs/mcp_tools_discovered.md"
+    }
+  }
+}

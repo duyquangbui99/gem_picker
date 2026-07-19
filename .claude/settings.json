@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(data/shortlists/*)",
+      "Write(data/shortlists/*)",
+      "mcp__robinhood-trading",
+      "mcp__coinbase"
+    ],
+    "deny": [
+      "Bash",
+      "WebSearch"
+    ],
+    "defaultMode": "default"
+  }
+}
