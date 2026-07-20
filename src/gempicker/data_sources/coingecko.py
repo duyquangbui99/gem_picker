@@ -58,6 +58,17 @@ def get_markets_universe(
     return cached_json(cache_dir, "coingecko_markets_universe", ttl_seconds, fetch)
 
 
+def get_simple_price(session: requests.Session, api_key: str, coin_id: str) -> float | None:
+    """Live USD price for a single coin — used by the manual-trade P&L
+    tracker. Uncached: this is meant to reflect the current price, not a
+    snapshot from up to an hour ago."""
+    try:
+        data = _get(session, api_key, "/simple/price", {"ids": coin_id, "vs_currencies": "usd"})
+        return data.get(coin_id, {}).get("usd")
+    except requests.RequestException:
+        return None
+
+
 def get_coin_detail(session: requests.Session, api_key: str, cache_dir: Path, coin_id: str, ttl_seconds: int = 3600) -> dict:
     """Per-coin detail (community/public-interest stats) for shortlist
     enrichment only — too expensive to call for the whole universe."""

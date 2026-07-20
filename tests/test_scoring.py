@@ -22,20 +22,44 @@ def test_momentum_score_penalizes_overextension():
 
 
 def test_weighted_composite_renormalizes_over_missing_signals():
-    # only two of three signals present; weights should renormalize over those two
+    # only two of three signals present; weights renormalize over those two,
+    # then the whole thing is dampened by sqrt(available_weight/total_weight)
+    # to reflect the incomplete evidence base (see the sparse-signal test below).
     score, breakdown = weighted_composite(
         {"a": 100.0, "b": 0.0, "c": None},
         {"a": 0.5, "b": 0.3, "c": 0.2},
     )
     assert "c" not in breakdown
-    # a:b weight ratio is 5:3, so composite = 100 * (0.5/0.8) = 62.5
-    assert score == 62.5
+    # raw = 100 * (0.5/0.8) = 62.5; confidence = sqrt(0.8/1.0) = 0.8944; 62.5*0.8944 = 55.9
+    assert score == 55.9
 
 
 def test_weighted_composite_all_missing_returns_zero():
     score, breakdown = weighted_composite({"a": None}, {"a": 1.0})
     assert score == 0.0
     assert breakdown == {}
+
+
+def test_weighted_composite_single_sparse_signal_cannot_reach_a_perfect_score():
+    """Regression test for a real bug found in production: a stock (FTH)
+    with only one of four signals available (insider_activity, from a raw
+    Form-4 filing count) scored a "perfect" 100 because the old
+    implementation let that one signal absorb 100% of the renormalized
+    weight. A single noisy metric on an otherwise-unknown candidate must not
+    be able to outscore a candidate with a full, moderate evidence base."""
+    weights = {"revenue_growth": 0.30, "insider_activity": 0.15, "price_momentum": 0.25, "social_momentum": 0.30}
+
+    sparse_score, _ = weighted_composite(
+        {"revenue_growth": None, "insider_activity": 100.0, "price_momentum": None, "social_momentum": None},
+        weights,
+    )
+    well_rounded_score, _ = weighted_composite(
+        {"revenue_growth": 65.0, "insider_activity": 50.0, "price_momentum": 60.0, "social_momentum": 55.0},
+        weights,
+    )
+
+    assert sparse_score < 50.0  # nowhere near "perfect" despite its one signal being maxed out
+    assert sparse_score < well_rounded_score
 
 
 def test_score_crypto_candidate_flags_thin_liquidity():

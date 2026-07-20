@@ -55,9 +55,31 @@ def test_record_judge_result_updates_claimed_row(tmp_path):
     assert row["claude_session_id"] == "sess-1"
 
 
-def test_mark_error_sets_status(tmp_path):
+def test_mark_error_sets_status_and_message(tmp_path):
     conn = get_connection(tmp_path / "test.db")
     claim_day(conn, "2026-07-19", dry_run=True)
-    mark_error(conn, "2026-07-19", True, status="judge_error")
-    row = conn.execute("SELECT order_status FROM picks WHERE trade_date=? AND dry_run=1", ("2026-07-19",)).fetchone()
+    mark_error(conn, "2026-07-19", True, status="judge_error", error_message="claude -p timed out after 300s")
+    row = conn.execute("SELECT order_status, error_message FROM picks WHERE trade_date=? AND dry_run=1", ("2026-07-19",)).fetchone()
     assert row["order_status"] == "judge_error"
+    assert row["error_message"] == "claude -p timed out after 300s"
+
+
+def test_failed_day_is_immediately_reclaimable(tmp_path):
+    """A judge_error/error/lock_contention status must be retryable right
+    away, unlike a genuine completion (filled/skipped_dry_run) which must
+    NOT be silently re-run."""
+    conn = get_connection(tmp_path / "test.db")
+    claim_day(conn, "2026-07-19", dry_run=True)
+    mark_error(conn, "2026-07-19", True, status="judge_error", error_message="boom")
+    assert claim_day(conn, "2026-07-19", dry_run=True) is True
+
+
+def test_completed_day_is_not_reclaimable(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    claim_day(conn, "2026-07-19", dry_run=True)
+    result = JudgeResult(
+        date="2026-07-19", dry_run=True, asset_class="crypto", symbol="ABC",
+        score=50.0, risk_tier="low", rationale="r", order=None,
+    )
+    record_judge_result(conn, "2026-07-19", True, result)
+    assert claim_day(conn, "2026-07-19", dry_run=True) is False

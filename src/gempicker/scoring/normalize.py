@@ -37,11 +37,26 @@ def momentum_score(pct_change: float | None, sweet_spot: tuple[float, float] = (
 def weighted_composite(scores: dict[str, float | None], weights: dict[str, float]) -> tuple[float, dict[str, float]]:
     """Weighted average over only the signals that have data, with weights
     renormalized across the available subset (missing data shouldn't silently
-    drag a candidate's score down just because a free API had a gap)."""
+    drag a candidate's score down just because a free API had a gap) --
+    THEN dampened by how much of the total evidence base was actually
+    available. Without this, a candidate missing 3 of 4 signals lets its one
+    remaining signal absorb 100% of the weight, so a single noisy metric
+    (e.g. a raw insider-filing count) can produce a "perfect" 100 purely
+    because everything else was unknown -- letting sparse-data candidates
+    silently outrank well-rounded ones. Confidence scales with sqrt() of the
+    available weight fraction rather than linearly, so losing one signal out
+    of four (a normal, expected gap) isn't punished as harshly as this
+    FTH-style near-total data void was (verified live: a stock scoring 100
+    off insider_activity alone, with revenue/momentum/social all missing)."""
     available = {k: v for k, v in scores.items() if v is not None}
     if not available:
         return 0.0, {}
 
-    total_weight = sum(weights[k] for k in available)
-    composite = sum(available[k] * weights[k] for k in available) / total_weight
+    total_weight = sum(weights.values())
+    available_weight = sum(weights[k] for k in available)
+    raw_composite = sum(available[k] * weights[k] for k in available) / available_weight
+
+    confidence = (available_weight / total_weight) ** 0.5
+    composite = raw_composite * confidence
+
     return round(composite, 2), {k: round(v, 2) for k, v in available.items()}

@@ -12,6 +12,19 @@
 
 set -e
 
+echo "Step 0: Trust this workspace"
+echo "-----------------------------------"
+echo "Verified live: headless 'claude -p' silently IGNORES all of .claude/settings.json's"
+echo "permissions.allow/deny rules until this workspace has been explicitly trusted --"
+echo "it prints 'Ignoring N permissions.allow entries ... this workspace has not been"
+echo "trusted' and falls back to default behavior instead. This defeats the whole"
+echo "purpose of the narrow MCP tool allow-list for unattended runs."
+echo "Fix: run 'claude' interactively in this directory once and accept the trust"
+echo "dialog (or set projects[\"<this path>\"].hasTrustDialogAccepted: true in"
+echo "~/.claude.json yourself if you understand what that skips). Do this BEFORE"
+echo "relying on any headless/cron run for real."
+echo
+
 echo "Step 1: Robinhood Agentic Trading"
 echo "-----------------------------------"
 echo "Already registered in .mcp.json as 'robinhood-trading'."

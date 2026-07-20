@@ -31,13 +31,16 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
     session = new_session("gempicker/0.1 (crypto screener)")
 
     universe = coingecko.get_markets_universe(session, settings.coingecko_api_key, settings.cache_dir)
+    print(f"[crypto] universe: {len(universe)} coins from CoinGecko", flush=True)
     tradeable = coinbase_products.get_tradeable_symbols(session, settings.cache_dir)
+    print(f"[crypto] {len(tradeable)} symbols tradeable on Coinbase", flush=True)
 
     survivors: list[tuple[dict, str]] = []
     for coin in universe:
         product_id = _hard_filters(coin, settings, tradeable)
         if product_id:
             survivors.append((coin, product_id))
+    print(f"[crypto] hard filters (Coinbase-tradeable, cap range, liquidity): {len(survivors)} survivors", flush=True)
 
     # cheap pre-rank by raw 7d momentum to cap how many get expensive per-coin enrichment calls
     survivors.sort(key=lambda cp: cp[0].get("price_change_percentage_7d_in_currency") or -999, reverse=True)
@@ -45,6 +48,7 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
     tvl_map = defillama.get_symbol_tvl_map(session, settings.cache_dir)
 
+    print(f"[crypto] enriching + scoring top {len(enrichment_pool)} candidates...", flush=True)
     scored: list[ScoredCandidate] = []
     for coin, product_id in enrichment_pool:
         symbol = coin["symbol"].upper()
@@ -66,4 +70,6 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
         scored.append(score_crypto_candidate(coin, tvl_info, transfer_count, community_data, product_id))
 
     scored.sort(key=lambda c: c.score, reverse=True)
-    return scored[: settings.crypto_shortlist_size], len(universe)
+    shortlist = scored[: settings.crypto_shortlist_size]
+    print(f"[crypto] done: shortlist of {len(shortlist)} (top score {shortlist[0].score if shortlist else 'n/a'})", flush=True)
+    return shortlist, len(universe)

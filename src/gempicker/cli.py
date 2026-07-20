@@ -1,3 +1,4 @@
+import traceback
 from datetime import date as date_cls
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from gempicker.db import claim_day, get_connection, mark_error
 from gempicker.judge.claude_runner import ClaudeRunError, run_claude_judge
 from gempicker.judge.prompt_builder import build_prompt
 from gempicker.judge.result_parser import ResultValidationError, parse_and_validate
+from gempicker.lock import PipelineLockedError, pipeline_lock
 from gempicker.pipeline import build_daily_shortlist
 from gempicker.trade_log import export, log_pick, log_shortlist, recent
 
@@ -19,7 +21,12 @@ def screen(date: str = typer.Option(None, help="YYYY-MM-DD, defaults to today"))
     """Run the deterministic screening pipeline only; writes the shortlist JSON. No LLM, no trades."""
     settings = get_settings()
     trade_date = date or date_cls.today().isoformat()
-    shortlist, path = build_daily_shortlist(settings, trade_date)
+    try:
+        with pipeline_lock(settings.data_dir):
+            shortlist, path = build_daily_shortlist(settings, trade_date)
+    except PipelineLockedError as e:
+        typer.echo(f"ERROR: {e}", err=True)
+        raise typer.Exit(code=1)
     typer.echo(f"Shortlist written to {path}")
     typer.echo(f"  stocks: {len(shortlist.stocks)} (universe {shortlist.meta.stock_universe_size})")
     typer.echo(f"  crypto: {len(shortlist.crypto)} (universe {shortlist.meta.crypto_universe_size})")
@@ -43,16 +50,18 @@ def run(
         raise typer.Exit(code=0)
 
     try:
-        shortlist, shortlist_path = build_daily_shortlist(settings, trade_date)
-        log_shortlist(conn, shortlist)
+        with pipeline_lock(settings.data_dir):
+            shortlist, shortlist_path = build_daily_shortlist(settings, trade_date)
+            log_shortlist(conn, shortlist)
 
-        result_path = settings.shortlists_dir / f"{trade_date}.result.json"
-        if result_path.exists():
-            result_path.unlink()
+            result_path = settings.shortlists_dir / f"{trade_date}.result.json"
+            if result_path.exists():
+                result_path.unlink()
 
-        prompt = build_prompt(shortlist_path, result_path, trade_date, settings.gempicker_trade_usd, dry_run)
-        cli_meta = run_claude_judge(prompt, PROJECT_ROOT)
-        result = parse_and_validate(result_path, trade_date, dry_run)
+            typer.echo("Shortlist built. Invoking Claude for judgment...")
+            prompt = build_prompt(shortlist_path, result_path, trade_date, settings.gempicker_trade_usd, dry_run)
+            cli_meta = run_claude_judge(prompt, PROJECT_ROOT)
+            result = parse_and_validate(result_path, trade_date, dry_run)
 
         log_pick(
             conn,
@@ -66,12 +75,16 @@ def run(
         if not dry_run:
             typer.echo(f"Order: {result.order}")
 
+    except PipelineLockedError as e:
+        mark_error(conn, trade_date, dry_run, status="lock_contention", error_message=str(e))
+        typer.echo(f"ERROR: {e}", err=True)
+        raise typer.Exit(code=1)
     except (ClaudeRunError, ResultValidationError) as e:
-        mark_error(conn, trade_date, dry_run, status="judge_error")
+        mark_error(conn, trade_date, dry_run, status="judge_error", error_message=str(e))
         typer.echo(f"ERROR: {e}", err=True)
         raise typer.Exit(code=1)
     except Exception as e:
-        mark_error(conn, trade_date, dry_run, status="error")
+        mark_error(conn, trade_date, dry_run, status="error", error_message=traceback.format_exc())
         typer.echo(f"ERROR: {e}", err=True)
         raise typer.Exit(code=1)
 
