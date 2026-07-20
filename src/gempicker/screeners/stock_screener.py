@@ -146,6 +146,7 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
     fmp_calls_used = fmp.get_calls_used_today(settings.cache_dir)
     scored: list[ScoredCandidate] = []
+    reddit_unavailable = 0
     for symbol in hard_filter_survivors:
         profile = finnhub_ds.get_company_profile(session, settings.finnhub_api_key, settings.cache_dir, symbol)
         metric = finnhub_ds.get_basic_financials(session, settings.finnhub_api_key, settings.cache_dir, symbol)
@@ -153,7 +154,7 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
         facts = sec_edgar.get_company_facts(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
 
         revenue_growth = sec_edgar.get_revenue_growth(facts)
-        form4_count = sec_edgar.recent_form4_count(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
+        insider_transactions = sec_edgar.recent_insider_transactions(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
         momentum = finnhub_ds.momentum_pct(metric)
         stwits = stocktwits.get_sentiment_snapshot(session, settings.cache_dir, symbol)
         reddit_mentions = reddit_ds.count_mentions(
@@ -165,9 +166,18 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
             symbol,
             STOCK_SUBREDDITS,
         )
+        if reddit_mentions is None:
+            reddit_unavailable += 1
 
         scored.append(
-            score_stock_candidate(symbol, profile, revenue_growth, form4_count, momentum, stwits, reddit_mentions)
+            score_stock_candidate(symbol, profile, revenue_growth, insider_transactions, momentum, stwits, reddit_mentions)
+        )
+
+    if reddit_unavailable:
+        print(
+            f"[stocks] warning: Reddit mentions unavailable for {reddit_unavailable}/{len(hard_filter_survivors)} "
+            "candidates (check REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET); social score is StockTwits-only for those",
+            flush=True,
         )
 
     scored.sort(key=lambda c: c.score, reverse=True)

@@ -27,14 +27,28 @@ def score_crypto_candidate(
 
     onchain_activity = min_max_score(transfer_count, 0, 500) if transfer_count is not None else None
 
+    # Each community source contributes only when CoinGecko actually returned
+    # data for it. The old neutral fallbacks collapsed every low-profile coin
+    # to the same constant -- verified live on the 2026-07-19 run, where all 8
+    # picks scored exactly 25.0 (reddit activity 0 scored as a genuine zero,
+    # missing sentiment injected as 50). Zero reddit activity is treated as
+    # missing rather than bearish because the free tier reports 0 both for
+    # dead subreddits and for coins it simply has no subreddit mapping for.
+    # The old `min_max_score(...) or 50` fallback also turned a genuine
+    # rock-bottom sentiment score of 0.0 into a neutral 50 (falsy float).
     social_momentum = None
     if community_data is not None:
-        reddit_posts = community_data.get("reddit_average_posts_48h") or 0
-        reddit_comments = community_data.get("reddit_average_comments_48h") or 0
-        sentiment_up_pct = community_data.get("sentiment_votes_up_percentage")
-        activity_score = min_max_score(reddit_posts + reddit_comments, 0, 20) or 0
-        sentiment_score = min_max_score(sentiment_up_pct, 30, 90) or 50
-        social_momentum = round((activity_score + sentiment_score) / 2, 2)
+        components: list[float] = []
+        reddit_activity = (community_data.get("reddit_average_posts_48h") or 0) + (
+            community_data.get("reddit_average_comments_48h") or 0
+        )
+        if reddit_activity > 0:
+            components.append(min_max_score(reddit_activity, 0, 20))
+        sentiment_score = min_max_score(community_data.get("sentiment_votes_up_percentage"), 30, 90)
+        if sentiment_score is not None:
+            components.append(sentiment_score)
+        if components:
+            social_momentum = round(sum(components) / len(components), 2)
 
     score, breakdown = weighted_composite(
         {

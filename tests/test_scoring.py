@@ -1,6 +1,6 @@
 from gempicker.scoring.crypto_scoring import score_crypto_candidate
 from gempicker.scoring.normalize import min_max_score, momentum_score, weighted_composite
-from gempicker.scoring.stock_scoring import score_stock_candidate
+from gempicker.scoring.stock_scoring import insider_activity_score, score_stock_candidate
 
 
 def test_min_max_score_clamps_and_scales():
@@ -76,6 +76,36 @@ def test_score_crypto_candidate_flags_thin_liquidity():
     assert candidate.meta["coinbase_product_id"] == "SOME-USD"
 
 
+def test_score_crypto_candidate_empty_community_data_is_not_a_constant_25():
+    """Regression test for a real bug found in production: CoinGecko's free
+    tier returned no reddit activity and no sentiment for any candidate, and
+    the old (0 + neutral-50)/2 fallback gave all 8 crypto picks the identical
+    social score of 25.0. Empty community data must mean "no signal"."""
+    coin = {
+        "id": "coin-b",
+        "symbol": "BBB",
+        "name": "Coin B",
+        "market_cap": 100_000_000,
+        "total_volume": 5_000_000,
+        "price_change_percentage_7d_in_currency": 15,
+    }
+    empty_community = {"reddit_average_posts_48h": 0, "reddit_average_comments_48h": 0, "sentiment_votes_up_percentage": None}
+    candidate = score_crypto_candidate(coin, None, None, empty_community, "BBB-USD")
+    assert "social_momentum" not in candidate.score_breakdown
+
+    sentiment_only = score_crypto_candidate(
+        coin, None, None, {**empty_community, "sentiment_votes_up_percentage": 90}, "BBB-USD"
+    )
+    assert sentiment_only.score_breakdown["social_momentum"] == 100.0
+
+    # a genuinely bad sentiment must score low, not fall back to neutral
+    # (the old `min_max_score(...) or 50` turned a 0.0 score into 50)
+    bearish = score_crypto_candidate(
+        coin, None, None, {**empty_community, "sentiment_votes_up_percentage": 20}, "BBB-USD"
+    )
+    assert bearish.score_breakdown["social_momentum"] == 0.0
+
+
 def test_score_crypto_candidate_missing_tvl_is_neutral_not_penalized():
     coin = {
         "id": "coin-a",
@@ -94,9 +124,14 @@ def test_score_crypto_candidate_missing_tvl_is_neutral_not_penalized():
     assert "tvl_trend" not in without_tvl.score_breakdown
 
 
+BUYS_ONLY = {"buy_usd": 500_000.0, "sell_usd": 0.0, "buy_count": 3, "sell_count": 0}
+SELLS_ONLY = {"buy_usd": 0.0, "sell_usd": 500_000.0, "buy_count": 0, "sell_count": 3}
+NO_TRADES = {"buy_usd": 0.0, "sell_usd": 0.0, "buy_count": 0, "sell_count": 0}
+
+
 def test_score_stock_candidate_flags_missing_revenue_data():
     profile = {"name": "Test Co", "marketCapitalization": 500, "exchange": "NASDAQ"}
-    candidate = score_stock_candidate("TEST", profile, None, 2, 10, None, None)
+    candidate = score_stock_candidate("TEST", profile, None, BUYS_ONLY, 10, None, None)
     assert "no_revenue_data" in candidate.flags
     assert candidate.market_cap == 500_000_000
 
@@ -104,11 +139,39 @@ def test_score_stock_candidate_flags_missing_revenue_data():
 def test_score_stock_candidate_social_uses_bull_ratio():
     profile = {"name": "Test Co", "marketCapitalization": 500, "exchange": "NASDAQ"}
     bullish = score_stock_candidate(
-        "TEST", profile, 10, 1, 10,
+        "TEST", profile, 10, NO_TRADES, 10,
         {"message_count": 10, "bullish_count": 9, "bearish_count": 1}, 5,
     )
     bearish = score_stock_candidate(
-        "TEST", profile, 10, 1, 10,
+        "TEST", profile, 10, NO_TRADES, 10,
         {"message_count": 10, "bullish_count": 1, "bearish_count": 9}, 5,
     )
     assert bullish.score_breakdown["social_momentum"] > bearish.score_breakdown["social_momentum"]
+
+
+def test_insider_score_rewards_buying_and_punishes_selling():
+    """Regression test for a real bug found in production: the old signal
+    scored raw Form 4 filing frequency, so MRAM's 19 all-sale filings in 90
+    days produced a perfect 100 insider score. Direction must matter."""
+    assert insider_activity_score(BUYS_ONLY) == 100.0
+    assert insider_activity_score(SELLS_ONLY) == 0.0
+    assert insider_activity_score(NO_TRADES) == 50.0  # checked, nothing traded: neutral
+    assert insider_activity_score(None) is None  # data unavailable: excluded
+
+
+def test_insider_score_small_dollar_trades_shrink_toward_neutral():
+    tiny_buy = {"buy_usd": 25_000.0, "sell_usd": 0.0, "buy_count": 1, "sell_count": 0}
+    assert 50.0 < insider_activity_score(tiny_buy) < 60.0  # not a conviction signal
+
+
+def test_score_stock_candidate_missing_social_sources_excluded_not_neutral():
+    """Regression test for a real bug found in production: with Reddit
+    unconfigured, its None result was averaged in as a neutral 50, so 6 of 8
+    shortlisted stocks got the identical social score at 30% weight."""
+    profile = {"name": "Test Co", "marketCapitalization": 500, "exchange": "NASDAQ"}
+    no_social = score_stock_candidate("TEST", profile, 10, NO_TRADES, 10, None, None)
+    assert "social_momentum" not in no_social.score_breakdown
+    assert "no_social_data" in no_social.flags
+
+    reddit_only = score_stock_candidate("TEST", profile, 10, NO_TRADES, 10, None, 15)
+    assert reddit_only.score_breakdown["social_momentum"] == 100.0  # sole source used alone
