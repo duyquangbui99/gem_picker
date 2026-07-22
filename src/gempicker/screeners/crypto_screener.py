@@ -50,6 +50,7 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
     print(f"[crypto] enriching + scoring top {len(enrichment_pool)} candidates...", flush=True)
     scored: list[ScoredCandidate] = []
+    social_missing = 0
     for coin, product_id in enrichment_pool:
         symbol = coin["symbol"].upper()
         tvl_info = tvl_map.get(symbol)
@@ -67,7 +68,18 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
         if eth_contract:
             transfer_count = etherscan.recent_transfer_count(session, settings.etherscan_api_key, settings.cache_dir, eth_contract)
 
-        scored.append(score_crypto_candidate(coin, tvl_info, transfer_count, community_data, product_id))
+        candidate = score_crypto_candidate(coin, tvl_info, transfer_count, community_data, product_id)
+        if "social_momentum" not in candidate.score_breakdown:
+            social_missing += 1
+        scored.append(candidate)
+
+    if social_missing:
+        print(
+            f"[crypto] warning: social_momentum unavailable for {social_missing}/{len(enrichment_pool)} candidates "
+            "(CoinGecko community_data has returned no usable reddit/sentiment stats for a while now -- "
+            "these coins are being ranked on price_momentum/tvl_trend/onchain_activity only)",
+            flush=True,
+        )
 
     scored.sort(key=lambda c: c.score, reverse=True)
     shortlist = scored[: settings.crypto_shortlist_size]

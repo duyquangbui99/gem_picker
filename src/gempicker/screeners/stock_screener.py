@@ -1,4 +1,5 @@
-from pathlib import Path
+import random
+from datetime import date
 
 from gempicker.config import Settings
 from gempicker.data_sources import fmp, sec_edgar, stocktwits
@@ -7,13 +8,6 @@ from gempicker.data_sources import reddit as reddit_ds
 from gempicker.data_sources.base import new_session
 from gempicker.models import ScoredCandidate
 from gempicker.scoring.stock_scoring import score_stock_candidate
-
-# Finnhub's free tier is 60 calls/min; a cold cache across the whole US
-# small-cap universe (thousands of tickers) would take well over an hour on
-# day one. Cap fresh profile lookups per run and let the weekly-TTL cache
-# gradually warm up over the first ~1-2 weeks; already-cached symbols are
-# always evaluated fully regardless of this cap.
-MAX_NEW_PROFILE_LOOKUPS_PER_RUN = 400
 
 STOCK_SUBREDDITS = ["pennystocks", "stocks", "wallstreetbets"]
 
@@ -43,11 +37,6 @@ def _is_major_exchange(exchange: str | None) -> bool:
         return False
     exchange_upper = exchange.upper()
     return any(kw in exchange_upper for kw in _MAJOR_EXCHANGE_KEYWORDS)
-
-
-def _is_profile_cached(cache_dir: Path, symbol: str) -> bool:
-    path = cache_dir / f"finnhub_profile_{symbol}.json"
-    return path.exists()
 
 
 # Verified live: Finnhub and FMP disagreed on one small-cap's market cap by
@@ -80,28 +69,62 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
     session = new_session("gempicker/0.1 (stock screener)")
 
     universe = finnhub_ds.get_us_symbols(session, settings.finnhub_api_key, settings.cache_dir)
-    symbols = [s["symbol"] for s in universe if s.get("symbol")]
-    print(f"[stocks] universe: {len(symbols)} US common-stock symbols", flush=True)
-
-    cached_first = sorted(symbols, key=lambda sym: not _is_profile_cached(settings.cache_dir, sym))
-    already_cached = sum(1 for sym in symbols if _is_profile_cached(settings.cache_dir, sym))
+    # mic pre-filter: drop OTC/foreign venues using data already in the free
+    # universe payload, BEFORE any per-symbol profile spend -- 73% of the raw
+    # "US" universe is OTC that the exchange allowlist below would reject
+    # anyway, previously at the cost of one rate-limited call each.
+    listed = [s for s in universe if s.get("symbol") and s.get("mic") in finnhub_ds.MAJOR_US_MICS]
+    symbols = [s["symbol"] for s in listed]
     print(
-        f"[stocks] market-cap pre-filter: {already_cached} symbols cached from previous runs, "
-        f"up to {MAX_NEW_PROFILE_LOOKUPS_PER_RUN} new lookups this run (rate-limited ~1/sec on Finnhub's free tier)",
+        f"[stocks] universe: {len(universe)} US common-stock symbols; "
+        f"{len(symbols)} on major exchanges ({len(universe) - len(symbols)} OTC/other skipped free via mic)",
         flush=True,
     )
 
-    new_lookups_used = 0
+    fresh_set = {sym for sym in symbols if finnhub_ds.is_profile_cache_fresh(settings.cache_dir, sym)}
+    needs_fetch = [sym for sym in symbols if sym not in fresh_set]
+    # Shuffle with a per-day deterministic seed: when the fetch budget can't
+    # cover everything, each day samples the not-yet-fresh remainder
+    # uniformly instead of always burning the budget on the same
+    # alphabetical prefix of the universe (which left everything after the
+    # daily pointer systematically invisible during warm-up).
+    random.Random(date.today().isoformat()).shuffle(needs_fetch)
+    scan_order = sorted(fresh_set) + needs_fetch
+    budget = settings.stock_profile_fetch_budget
+    print(
+        f"[stocks] market-cap pre-filter: {len(fresh_set)} profiles fresh in cache, "
+        f"{len(needs_fetch)} need fetch/refresh (budget {budget}/run at ~1/sec; beyond it, "
+        "stale cache is served if present, never-seen symbols wait for a future run or warm-cache)",
+        flush=True,
+    )
+
+    fetches_used = 0
+    served_stale = 0
+    skipped_unseen = 0
     excluded_non_major = 0
     market_cap_survivors: list[str] = []
-    for i, symbol in enumerate(cached_first, start=1):
-        was_cached = _is_profile_cached(settings.cache_dir, symbol)
-        if not was_cached:
-            if new_lookups_used >= MAX_NEW_PROFILE_LOOKUPS_PER_RUN:
-                continue
-            new_lookups_used += 1
+    for i, symbol in enumerate(scan_order, start=1):
+        if symbol in fresh_set:
+            profile = finnhub_ds.get_company_profile(
+                session, settings.finnhub_api_key, settings.cache_dir, symbol,
+                ttl_seconds=finnhub_ds.profile_ttl_seconds(symbol),
+            )
+        elif fetches_used < budget:
+            fetches_used += 1
+            profile = finnhub_ds.get_company_profile(
+                session, settings.finnhub_api_key, settings.cache_dir, symbol,
+                ttl_seconds=finnhub_ds.profile_ttl_seconds(symbol),
+            )
+        elif finnhub_ds.has_profile_cache(settings.cache_dir, symbol):
+            served_stale += 1
+            profile = finnhub_ds.get_company_profile(
+                session, settings.finnhub_api_key, settings.cache_dir, symbol,
+                ttl_seconds=finnhub_ds.STALE_OK_TTL,
+            )
+        else:
+            skipped_unseen += 1
+            continue
 
-        profile = finnhub_ds.get_company_profile(session, settings.finnhub_api_key, settings.cache_dir, symbol)
         if not profile:
             continue
         mcap = (profile.get("marketCapitalization") or 0) * 1_000_000
@@ -113,22 +136,41 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
         if i % 100 == 0:
             print(
-                f"[stocks] ...{i}/{len(cached_first)} symbols checked, "
-                f"{new_lookups_used}/{MAX_NEW_PROFILE_LOOKUPS_PER_RUN} new API calls used, "
-                f"{len(market_cap_survivors)} in market-cap range on a major exchange so far "
-                f"({excluded_non_major} excluded as OTC/foreign-listed)",
+                f"[stocks] ...{i}/{len(scan_order)} symbols checked, "
+                f"{fetches_used}/{budget} fetches used ({served_stale} served stale, {skipped_unseen} unseen-skipped), "
+                f"{len(market_cap_survivors)} in market-cap range so far",
                 flush=True,
             )
 
-    print(f"[stocks] market-cap pre-filter done: {len(market_cap_survivors)} candidates in ${settings.stock_min_market_cap/1e6:.0f}M-${settings.stock_max_market_cap/1e6:.0f}M range on a major exchange ({excluded_non_major} OTC/foreign-listed excluded)", flush=True)
+    print(
+        f"[stocks] market-cap pre-filter done: {len(market_cap_survivors)} candidates in "
+        f"${settings.stock_min_market_cap/1e6:.0f}M-${settings.stock_max_market_cap/1e6:.0f}M range "
+        f"({fetches_used} fetched, {served_stale} served from stale cache, {skipped_unseen} unseen symbols deferred, "
+        f"{excluded_non_major} excluded by exchange allowlist)",
+        flush=True,
+    )
+    if skipped_unseen:
+        print(
+            f"[stocks] note: {skipped_unseen} symbols have never been profiled and were deferred by the "
+            "fetch budget -- run `gempicker warm-cache` once to eliminate this backlog",
+            flush=True,
+        )
 
     cik_map = sec_edgar.get_ticker_cik_map(session, settings.sec_edgar_contact_email, settings.cache_dir)
 
     print(f"[stocks] checking liquidity + SEC EDGAR financials for {len(market_cap_survivors)} candidates...", flush=True)
     hard_filter_survivors: list[str] = []
     for symbol in market_cap_survivors:
-        quote = finnhub_ds.get_quote(session, settings.finnhub_api_key, settings.cache_dir, symbol)
-        metric = finnhub_ds.get_basic_financials(session, settings.finnhub_api_key, settings.cache_dir, symbol)
+        # daily_ttl_seconds, not the 1hr default: this pipeline runs once a
+        # day, so a 1hr TTL was a guaranteed cache miss for every candidate
+        # on every run -- this liquidity check was the single largest
+        # recurring cost in the pipeline as a result.
+        quote = finnhub_ds.get_quote(
+            session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.daily_ttl_seconds(symbol)
+        )
+        metric = finnhub_ds.get_basic_financials(
+            session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.daily_ttl_seconds(symbol)
+        )
         avg_vol = finnhub_ds.avg_dollar_volume(metric, quote.get("c") if quote else None)
         if not avg_vol or avg_vol < settings.stock_min_avg_dollar_volume:
             continue
@@ -147,30 +189,56 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
     fmp_calls_used = fmp.get_calls_used_today(settings.cache_dir)
     scored: list[ScoredCandidate] = []
     reddit_unavailable = 0
+    scoring_failures: list[str] = []
     for symbol in hard_filter_survivors:
-        profile = finnhub_ds.get_company_profile(session, settings.finnhub_api_key, settings.cache_dir, symbol)
-        metric = finnhub_ds.get_basic_financials(session, settings.finnhub_api_key, settings.cache_dir, symbol)
-        cik = cik_map[symbol]
-        facts = sec_edgar.get_company_facts(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
+        try:
+            # STALE_OK_TTL: this profile was already read (possibly served
+            # stale) in the pre-filter; re-reading with the normal TTL here
+            # could trigger a surprise refetch outside the budget accounting.
+            profile = finnhub_ds.get_company_profile(
+                session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.STALE_OK_TTL
+            )
+            metric = finnhub_ds.get_basic_financials(
+                session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.daily_ttl_seconds(symbol)
+            )
+            cik = cik_map[symbol]
+            facts = sec_edgar.get_company_facts(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
 
-        revenue_growth = sec_edgar.get_revenue_growth(facts)
-        insider_transactions = sec_edgar.recent_insider_transactions(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
-        momentum = finnhub_ds.momentum_pct(metric)
-        stwits = stocktwits.get_sentiment_snapshot(session, settings.cache_dir, symbol)
-        reddit_mentions = reddit_ds.count_mentions(
-            session,
-            settings.reddit_client_id,
-            settings.reddit_client_secret,
-            settings.reddit_user_agent,
-            settings.cache_dir,
-            symbol,
-            STOCK_SUBREDDITS,
-        )
-        if reddit_mentions is None:
-            reddit_unavailable += 1
+            revenue_growth = sec_edgar.get_revenue_growth(facts)
+            insider_transactions = sec_edgar.recent_insider_transactions(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
+            momentum = finnhub_ds.momentum_pct(metric)
+            stwits = stocktwits.get_sentiment_snapshot(session, settings.cache_dir, symbol)
+            reddit_mentions = reddit_ds.count_mentions(
+                session,
+                settings.reddit_client_id,
+                settings.reddit_client_secret,
+                settings.reddit_user_agent,
+                settings.cache_dir,
+                symbol,
+                STOCK_SUBREDDITS,
+            )
+            if reddit_mentions is None:
+                reddit_unavailable += 1
 
-        scored.append(
-            score_stock_candidate(symbol, profile, revenue_growth, insider_transactions, momentum, stwits, reddit_mentions)
+            scored.append(
+                score_stock_candidate(symbol, profile, revenue_growth, insider_transactions, momentum, stwits, reddit_mentions)
+            )
+        except Exception as e:
+            # One symbol's data pull failing (rate limit, transient I/O,
+            # malformed API response, ...) must not discard every candidate
+            # already successfully scored -- verified live: an unrelated
+            # local-cache read hiccup on a single symbol previously escaped
+            # this loop entirely and zeroed out the whole day's stock
+            # shortlist (caught only by pipeline.py's screener-level
+            # isolation, discarding all 1640 survivors' work, not just one).
+            scoring_failures.append(f"{symbol}: {e}")
+
+    if scoring_failures:
+        print(
+            f"[stocks] warning: {len(scoring_failures)}/{len(hard_filter_survivors)} candidates failed to score "
+            f"and were skipped: {', '.join(scoring_failures[:5])}"
+            + (f" (+{len(scoring_failures) - 5} more)" if len(scoring_failures) > 5 else ""),
+            flush=True,
         )
 
     if reddit_unavailable:

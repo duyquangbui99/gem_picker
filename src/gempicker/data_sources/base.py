@@ -34,7 +34,21 @@ def cached_json(cache_dir: Path, cache_key: str, ttl_seconds: int, fetch_fn: Cal
     if cache_path.exists():
         age = time.time() - cache_path.stat().st_mtime
         if age < ttl_seconds:
-            return json.loads(cache_path.read_text())
+            try:
+                return json.loads(cache_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                # A cache file existing doesn't guarantee it's readable --
+                # verified live: this project lives under an iCloud Drive
+                # "Desktop & Documents" synced folder on a nearly-full disk,
+                # where macOS evicts local content to dataless placeholders
+                # (nonzero logical size, 0 disk blocks) and a read has to
+                # materialize it on demand; that materialization can time out
+                # (OSError/TimeoutError), and an interrupted write under the
+                # same sync pressure can also leave a truncated/corrupt file.
+                # Either way this is exactly what a cache is for: treat it as
+                # a miss and refetch rather than letting a local I/O hiccup
+                # crash the caller.
+                pass
 
     data = fetch_fn()
     cache_dir.mkdir(parents=True, exist_ok=True)

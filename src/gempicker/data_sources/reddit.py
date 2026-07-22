@@ -47,7 +47,12 @@ def count_mentions(
 ) -> int | None:
     """Count of posts mentioning `query` in the trailing week across the
     given subreddits. Returns None on auth/lookup failure (neutral, not a
-    red flag)."""
+    red flag), or immediately if no credentials are configured -- verified
+    live: with client_id/secret blank, every call was still making a real
+    (guaranteed-401) request to Reddit's OAuth endpoint, once per candidate
+    per run, for a feature that can never succeed without credentials."""
+    if not client_id or not client_secret:
+        return None
 
     def fetch() -> int:
         token = _get_access_token(session, client_id, client_secret, user_agent)

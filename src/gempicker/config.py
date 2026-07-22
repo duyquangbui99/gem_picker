@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     crypto_top_rank_exclusion: int = 100
 
     fmp_daily_call_budget: int = 250
+    # Max Finnhub profile fetches (new + TTL refresh) per screening run, at
+    # ~1/sec. Beyond it, expired-but-present profiles are served stale and
+    # never-seen symbols are skipped until a future run or `warm-cache`.
+    stock_profile_fetch_budget: int = 1000
 
     data_dir: Path = Field(default=PROJECT_ROOT / "data")
 

@@ -5,6 +5,8 @@ from pathlib import Path
 import typer
 
 from gempicker.config import PROJECT_ROOT, get_settings
+from gempicker.data_sources import finnhub
+from gempicker.data_sources.base import new_session
 from gempicker.db import claim_day, get_connection, mark_error
 from gempicker.judge.claude_runner import ClaudeRunError, run_claude_judge
 from gempicker.judge.prompt_builder import build_prompt
@@ -32,6 +34,49 @@ def screen(date: str = typer.Option(None, help="YYYY-MM-DD, defaults to today"))
     typer.echo(f"  crypto: {len(shortlist.crypto)} (universe {shortlist.meta.crypto_universe_size})")
     for c in (shortlist.stocks + shortlist.crypto):
         typer.echo(f"    {c.asset_class:6} {c.symbol:8} score={c.score}")
+
+
+@app.command(name="warm-cache")
+def warm_cache(limit: int = typer.Option(0, help="Max profiles to fetch this session (0 = no limit)")) -> None:
+    """Backfill/refresh the Finnhub profile cache for every major-exchange
+    universe symbol, at the free-tier rate limit (~57/min). Resumable:
+    interrupt anytime, already-cached symbols are skipped next invocation.
+    Holds the pipeline lock, so no screen/run can execute concurrently."""
+    settings = get_settings()
+    session = new_session("gempicker/0.1 (cache warmer)")
+    try:
+        with pipeline_lock(settings.data_dir):
+            universe = finnhub.get_us_symbols(session, settings.finnhub_api_key, settings.cache_dir)
+            symbols = [s["symbol"] for s in universe if s.get("symbol") and s.get("mic") in finnhub.MAJOR_US_MICS]
+            todo = [sym for sym in symbols if not finnhub.is_profile_cache_fresh(settings.cache_dir, sym)]
+            if limit:
+                todo = todo[:limit]
+            typer.echo(
+                f"{len(symbols)} major-exchange symbols in universe; {len(todo)} need fetch/refresh "
+                f"(ETA ~{len(todo) * 1.05 / 60:.0f} min at the free-tier rate limit)"
+            )
+            fetched = failed = 0
+            try:
+                for i, sym in enumerate(todo, start=1):
+                    profile = finnhub.get_company_profile(
+                        session, settings.finnhub_api_key, settings.cache_dir, sym,
+                        ttl_seconds=finnhub.profile_ttl_seconds(sym),
+                    )
+                    # None with no cache file written = HTTP error (empty
+                    # profiles for dead tickers DO get cached, and count as done)
+                    if profile is None and not finnhub.has_profile_cache(settings.cache_dir, sym):
+                        failed += 1
+                    else:
+                        fetched += 1
+                    if i % 100 == 0:
+                        typer.echo(f"...{i}/{len(todo)} ({fetched} ok, {failed} failed)")
+            except KeyboardInterrupt:
+                typer.echo(f"\ninterrupted at {fetched + failed}/{len(todo)} -- progress is saved, just re-run to resume")
+                raise typer.Exit(code=130)
+            typer.echo(f"warm-cache done: {fetched} fetched, {failed} failed, {len(symbols) - len(todo)} were already fresh")
+    except PipelineLockedError as e:
+        typer.echo(f"ERROR: {e}", err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command()

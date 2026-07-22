@@ -21,10 +21,12 @@ file at `data/shortlists/{date}.json`.
    listed on a major exchange (NASDAQ/NYSE/CBOE/IEX — OTC and foreign-ADR listings are excluded;
    see "Data quality notes" below for why), minimum average dollar volume, and must have financial
    filings on record at SEC EDGAR (excludes shells).
-3. Score the survivors on: revenue growth (SEC EDGAR XBRL), insider buying activity (Form 4 filing
-   frequency), price momentum (Finnhub's 13-week return, with a penalty for being *too*
-   overextended — chasing blow-off tops is explicitly discouraged), and social momentum
-   (StockTwits + Reddit mention volume/sentiment).
+3. Score the survivors on: revenue growth (SEC EDGAR XBRL, freshest of the ASC 606/legacy tags,
+   annual periods only), net open-market insider buying vs. selling (parsed from individual Form 4
+   XMLs — transaction codes P/S in dollars, not raw filing counts), price momentum (Finnhub's
+   13-week return, with a penalty for being *too* overextended — chasing blow-off tops is
+   explicitly discouraged), and social momentum (StockTwits + Reddit mention volume/sentiment;
+   sources that return no data are excluded from the average, not defaulted to neutral).
 4. Take the top `STOCK_SHORTLIST_SIZE` (default 8), enrich them with an FMP company-profile call
    (budget-capped at 250/day, so it's shortlist-only, never used for the broad screen).
 
@@ -96,12 +98,24 @@ about since they shape why the pipeline looks the way it does:
 ## Performance notes
 
 Cold-cache runs are slow — the free-tier rate limits are the actual bottleneck, not the code.
-Finnhub's free tier is 60 calls/min; a fresh profile lookup is capped at 400 new symbols per run
-(`MAX_NEW_PROFILE_LOOKUPS_PER_RUN` in `stock_screener.py`) and the whole ~18,000-symbol universe
-gradually warms up (weekly TTL cache) over repeated runs rather than all at once. Expect the first
-several runs to take 10-20+ minutes; it gets faster as the cache fills in. The dashboard's Run tab
-streams live progress (`[stocks] ...1200/18447 symbols checked...`) instead of a silent spinner,
-specifically because this can take a while and a silent wait is indistinguishable from hanging.
+Finnhub's free tier is 60 calls/min. Three mechanisms keep runs bounded and honest about it:
+
+- **OTC is skipped before any spend**: 73% of Finnhub's raw "US" universe (~13,500 of ~18,400
+  symbols) is OTC, identified from the `mic` field already present in the free universe list —
+  so the real per-symbol profile workload is only the ~5,000 major-exchange symbols.
+- **A per-run fetch budget** (`STOCK_PROFILE_FETCH_BUDGET`, default 1000) counts *every* profile
+  network call — first-time fetches AND weekly-TTL refreshes (an earlier version counted file
+  existence as "cached", letting expired files trigger unbudgeted refreshes). Beyond the budget,
+  expired-but-present profiles are served stale (a weeks-old market cap still gates a $50M–$2B
+  band fine) and never-seen symbols are deferred. Deferred symbols are sampled in a
+  daily-seeded random order, so no fixed slice of the universe is systematically invisible.
+- **`gempicker warm-cache`** backfills every missing/expired profile in one resumable,
+  rate-limited pass (~1–2 hours from empty; interrupt and re-run freely). Run it once after
+  setup and the daily screen starts from full universe coverage. Per-symbol TTLs are jittered
+  (7–10 days) so a one-shot backfill doesn't expire all at once a week later.
+
+The dashboard's Run tab streams live progress (`[stocks] ...1200/4960 symbols checked...`)
+instead of a silent spinner, specifically because slow runs are indistinguishable from hangs.
 
 A cross-process lock (`src/gempicker/lock.py`, `data/.pipeline.lock`) prevents two screens/runs
 from ever executing concurrently — important because overlapping runs both waste the daily
@@ -175,6 +189,9 @@ Opens a local browser UI with three tabs:
 ### CLI
 
 ```sh
+# one-time (or occasional) profile-cache backfill -- resumable, ~1-2h from empty
+uv run python -m gempicker.cli warm-cache
+
 # screen only (no LLM, no trades) -- inspect the shortlist
 uv run python -m gempicker.cli screen
 

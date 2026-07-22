@@ -73,6 +73,14 @@ Your task:
    qualitative red flags the automated score can't see (e.g. recent bad news, a halted ticker, an
    obvious data-quality glitch) — if you override the top score for such a reason, say so explicitly
    in "red_flags".
+   - A "market_cap_data_mismatch" flag means two data providers disagree materially on market cap.
+     You have no way to verify which figure is right (no web access here) or why they disagree — a
+     common real-world cause is a dual-class share structure, where the small figure is the tradeable
+     public float and the large one is total company value across a founder/insider-held share class
+     you cannot buy. If live, treat this flag as a strong reason to prefer a different candidate;
+     only pick a flagged one if it's clearly the best of a bad field, and if you do, set
+     risk_tier to "high" and say explicitly in "red_flags" that the tradeable float may be far
+     smaller than the quoted score's market cap assumed.
 2. If NO candidate exists in either list (empty shortlist), or all candidates in both lists have
    below-zero or clearly degenerate scores, you must still pick the least-bad available candidate —
    this system never skips a day. Only report a genuine error if BOTH lists are completely empty
