@@ -1,4 +1,5 @@
 import random
+import time
 from datetime import date
 
 from gempicker.config import Settings
@@ -188,26 +189,45 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
     fmp_calls_used = fmp.get_calls_used_today(settings.cache_dir)
     scored: list[ScoredCandidate] = []
+    industry_by_symbol: dict[str, str] = {}
     reddit_unavailable = 0
     scoring_failures: list[str] = []
-    for symbol in hard_filter_survivors:
+
+    # Diagnostic step-level logging (added while chasing a run that appeared
+    # to hang for 2+ hours during this exact loop, with no prior visibility
+    # into which candidate or which of the 6 per-candidate calls it was stuck
+    # on): every sub-step prints before it runs, so whatever line printed
+    # last when a hang is observed tells us exactly where it stalled.
+    def _log_step(i: int, total: int, symbol: str, step: str) -> None:
+        print(f"[{time.strftime('%H:%M:%S')}] [stocks] [{i}/{total}] {symbol}: {step}", flush=True)
+
+    scoring_started = time.monotonic()
+    total_to_score = len(hard_filter_survivors)
+    for i, symbol in enumerate(hard_filter_survivors, start=1):
         try:
             # STALE_OK_TTL: this profile was already read (possibly served
             # stale) in the pre-filter; re-reading with the normal TTL here
             # could trigger a surprise refetch outside the budget accounting.
+            _log_step(i, total_to_score, symbol, "profile")
             profile = finnhub_ds.get_company_profile(
                 session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.STALE_OK_TTL
             )
+            industry_by_symbol[symbol] = (profile or {}).get("finnhubIndustry") or "Unknown"
+            _log_step(i, total_to_score, symbol, "basic financials")
             metric = finnhub_ds.get_basic_financials(
                 session, settings.finnhub_api_key, settings.cache_dir, symbol, ttl_seconds=finnhub_ds.daily_ttl_seconds(symbol)
             )
             cik = cik_map[symbol]
+            _log_step(i, total_to_score, symbol, "SEC company facts")
             facts = sec_edgar.get_company_facts(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
 
             revenue_growth = sec_edgar.get_revenue_growth(facts)
+            _log_step(i, total_to_score, symbol, "SEC insider transactions (Form 4s)")
             insider_transactions = sec_edgar.recent_insider_transactions(session, settings.sec_edgar_contact_email, settings.cache_dir, cik)
             momentum = finnhub_ds.momentum_pct(metric)
+            _log_step(i, total_to_score, symbol, "StockTwits")
             stwits = stocktwits.get_sentiment_snapshot(session, settings.cache_dir, symbol)
+            _log_step(i, total_to_score, symbol, "Reddit")
             reddit_mentions = reddit_ds.count_mentions(
                 session,
                 settings.reddit_client_id,
@@ -233,6 +253,16 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
             # isolation, discarding all 1640 survivors' work, not just one).
             scoring_failures.append(f"{symbol}: {e}")
 
+        if i % 50 == 0 or i == total_to_score:
+            elapsed = time.monotonic() - scoring_started
+            rate = i / elapsed if elapsed > 0 else 0
+            eta_seconds = (total_to_score - i) / rate if rate > 0 else float("inf")
+            print(
+                f"[stocks] ...scored {i}/{total_to_score} "
+                f"({elapsed:.0f}s elapsed, {rate:.2f}/s, ~{eta_seconds / 60:.1f} min remaining)",
+                flush=True,
+            )
+
     if scoring_failures:
         print(
             f"[stocks] warning: {len(scoring_failures)}/{len(hard_filter_survivors)} candidates failed to score "
@@ -250,6 +280,35 @@ def run(settings: Settings) -> tuple[list[ScoredCandidate], int]:
 
     scored.sort(key=lambda c: c.score, reverse=True)
     shortlist = scored[: settings.stock_shortlist_size]
+
+    # Diagnostic only (not written to the shortlist JSON): shows where every
+    # scored candidate landed by industry, not just the 8 that made the cut --
+    # added because the score-driven top 8 skewed toward biotech/consumer
+    # names on 2026-07-21 and it wasn't obvious from the shortlist alone
+    # whether that was a hard filter excluding other sectors (it isn't; there
+    # is no sector filter anywhere in this pipeline) or just how the score
+    # distribution fell out that day.
+    if scored:
+        industry_scores: dict[str, list[float]] = {}
+        for c in scored:
+            industry_scores.setdefault(industry_by_symbol.get(c.symbol, "Unknown"), []).append(c.score)
+        cutoff = shortlist[-1].score
+        print(
+            f"[stocks] industry breakdown of all {len(scored)} scored candidates "
+            f"(shortlist cutoff score: {cutoff}, '*' = at least one candidate cleared it):",
+            flush=True,
+        )
+        for industry, industry_candidate_scores in sorted(
+            industry_scores.items(), key=lambda kv: max(kv[1]), reverse=True
+        ):
+            best = max(industry_candidate_scores)
+            avg = sum(industry_candidate_scores) / len(industry_candidate_scores)
+            marker = "*" if best >= cutoff else " "
+            print(
+                f"    [{marker}] {industry:40} n={len(industry_candidate_scores):4}  "
+                f"best={best:6.2f}  avg={avg:6.2f}",
+                flush=True,
+            )
 
     # FMP enrichment only for the final shortlist, budget-capped
     for candidate in shortlist:
